@@ -6,12 +6,23 @@ import { ConsoleShell } from "@/components/rmm/console-shell"
 import { KpiCards } from "@/components/rmm/kpi-cards"
 import { DeviceTable } from "@/components/rmm/device-table"
 import { AlertsPanel } from "@/components/rmm/alerts-panel"
-import { devices as allDevices, tenants } from "@/lib/rmm-data"
+import { devices as mockDevices, tenants } from "@/lib/rmm-data"
+import { useAgents, agentToDevice } from "@/lib/use-live-data"
 
 export default function Page() {
   const [tenant, setTenant] = React.useState("all")
   const [query, setQuery] = React.useState("")
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
+
+  // Live data from the Go backend (falls back to [] while loading / offline)
+  const { agents, loading: agentsLoading } = useAgents(5000)
+
+  // Use live agents when available, otherwise fall back to mock data
+  const liveDevices = React.useMemo(
+    () => (agents.length > 0 ? agents.map(agentToDevice) : []),
+    [agents]
+  )
+  const allDevices = liveDevices.length > 0 ? liveDevices : mockDevices
 
   const tenantName = tenants.find((t) => t.id === tenant)?.name
 
@@ -26,7 +37,7 @@ export default function Page() {
         d.tenant.toLowerCase().includes(q)
       return matchTenant && matchQuery
     })
-  }, [tenant, tenantName, query])
+  }, [tenant, tenantName, query, allDevices])
 
   const toggle = (id: string) =>
     setSelected((prev) => {
@@ -58,7 +69,11 @@ export default function Page() {
       onQueryChange={setQuery}
       selectedCount={selected.size}
       onRunScript={runScript}
-      title="Fleet Dashboard"
+      title={
+        !agentsLoading && liveDevices.length > 0
+          ? `Fleet Dashboard · ${liveDevices.length} live agent${liveDevices.length > 1 ? "s" : ""}`
+          : "Fleet Dashboard"
+      }
     >
       <KpiCards devices={filtered} />
 

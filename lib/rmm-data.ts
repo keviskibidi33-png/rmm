@@ -21,6 +21,7 @@ export type Device = {
   ramTrend: number[]
   diskTrend: number[]
   lastSync: string
+  lastSeen?: string
   ip: string
 }
 

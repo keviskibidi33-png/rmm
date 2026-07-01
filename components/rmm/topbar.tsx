@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { DeployAgentDialog } from "@/components/rmm/deploy-agent-dialog"
 import { tenants } from "@/lib/rmm-data"
+import { useAgents } from "@/lib/use-live-data"
+import { cn } from "@/lib/utils"
 
 export function Topbar({
   tenant,
@@ -28,12 +30,37 @@ export function Topbar({
   const tenantName = tenants.find((t) => t.id === tenant)?.name ?? "All Clients"
   const headerSubtitle = subtitle ?? tenantName
 
+  // Shows live backend connection status
+  const { agents, loading: agentsLoading, error: agentsError } = useAgents(5000)
+  const isLive = !agentsLoading && !agentsError && agents.length > 0
+  const isMock = !agentsLoading && (agentsError !== null || agents.length === 0)
+
   return (
     <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-background/80 px-4 backdrop-blur-md">
       <div className="flex min-w-0 flex-col leading-tight">
         <h1 className="truncate text-sm font-semibold tracking-tight">{title}</h1>
         <span className="truncate text-xs text-muted-foreground">{headerSubtitle}</span>
       </div>
+
+      {/* Backend connection status pill */}
+      <span
+        className={cn(
+          "hidden items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 sm:flex",
+          isLive
+            ? "bg-success/10 text-success ring-success/30"
+            : isMock
+              ? "bg-warning/10 text-warning ring-warning/30"
+              : "bg-muted/40 text-muted-foreground ring-border",
+        )}
+      >
+        <span
+          className={cn(
+            "size-1.5 rounded-full",
+            isLive ? "bg-success" : isMock ? "bg-warning" : "bg-muted-foreground",
+          )}
+        />
+        {agentsLoading ? "Connecting…" : isLive ? `${agents.length} live agent${agents.length > 1 ? "s" : ""}` : "Mock data"}
+      </span>
 
       {showSearch && (
         <div className="relative ml-auto hidden w-64 md:block">

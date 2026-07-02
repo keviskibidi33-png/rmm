@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -156,10 +159,31 @@ func initDB() {
 		executed_at TEXT,
 		created_at TEXT
 	);
+
+	CREATE TABLE IF NOT EXISTS users (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		username      TEXT UNIQUE,
+		password_hash TEXT
+	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
 		log.Fatalf("Schema migration failed: %v", err)
+	}
+
+	// Seed default admin user if none exist
+	var userCount int
+	db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&userCount)
+	if userCount == 0 {
+		hash, err := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
+		if err != nil {
+			log.Fatalf("Failed to hash default password: %v", err)
+		}
+		_, err = db.Exec(`INSERT INTO users (username, password_hash) VALUES ('admin', ?)`, string(hash))
+		if err != nil {
+			log.Fatalf("Failed to seed default admin user: %v", err)
+		}
+		log.Println("Default admin user created successfully ('admin' / 'password123')")
 	}
 
 	log.Println("Database initialised at ./rmm.db")
@@ -247,7 +271,7 @@ func saveTelemetryHistory(agentID string, t TelemetryPayload, timestamp string) 
 }
 
 
-// saveAlert writes an alert row to the database.
+// saveAlert writes an alert row to the database and broadcasts to frontend Event Hub.
 func saveAlert(agentID, severity, message string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := db.Exec(`
@@ -256,6 +280,8 @@ func saveAlert(agentID, severity, message string) {
 	if err != nil {
 		log.Printf("saveAlert error: %v", err)
 	}
+	// Broadcast immediately to connected frontends
+	broadcastEvent(severity, message, agentID)
 }
 
 // seedBackupJob ensures the agent has at least one backup job entry in the DB.
@@ -339,13 +365,163 @@ func handleRunBackup(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"queued"}`))
 }
 
+var jwtSecret = []byte("rmm-super-secret-key-change-in-prod")
+
+// handleLogin validates admin credentials and issues a JWT token.
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	var hash string
+	err := db.QueryRow(`SELECT password_hash FROM users WHERE username = ?`, req.Username).Scan(&hash)
+	if err != nil {
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		return
+	}
+
+	// Generate JWT Token expiring in 24 hours
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"username": req.Username,
+		"exp":      time.Now().Add(24 * time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString(jwtSecret)
+	if err != nil {
+		http.Error(w, "failed to sign token", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"token": tokenString,
+	})
+}
+
+// jwtMiddleware validates the authorization bearer token or query parameter.
+func jwtMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tokenStr := ""
+
+		// Check Authorization Header
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+
+		// Fallback: Check Query Params (for WebSocket handshakes)
+		if tokenStr == "" {
+			tokenStr = r.URL.Query().Get("token")
+		}
+
+		if tokenStr == "" {
+			http.Error(w, "unauthorized: missing token", http.StatusUnauthorized)
+			return
+		}
+
+		token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method")
+			}
+			return jwtSecret, nil
+		})
+
+		if err != nil || !token.Valid {
+			http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// ─── WebSocket Event Hub (Live Notifications) ─────────────────────────────────
+
+type ClientEventConnection struct {
+	Conn *websocket.Conn
+}
+
+var (
+	eventClients   = make(map[*ClientEventConnection]bool)
+	eventClientsMu sync.Mutex
+)
+
+// registerEventClient registers a frontend client to the notification hub.
+func registerEventClient(c *ClientEventConnection) {
+	eventClientsMu.Lock()
+	defer eventClientsMu.Unlock()
+	eventClients[c] = true
+	log.Println("Frontend client registered to Event Hub")
+}
+
+// unregisterEventClient removes a client.
+func unregisterEventClient(c *ClientEventConnection) {
+	eventClientsMu.Lock()
+	defer eventClientsMu.Unlock()
+	delete(eventClients, c)
+	log.Println("Frontend client unregistered from Event Hub")
+}
+
+// broadcastEvent pushes an event notification to all connected frontends.
+func broadcastEvent(alertType, message, agentID string) {
+	eventClientsMu.Lock()
+	defer eventClientsMu.Unlock()
+
+	payload := map[string]string{
+		"type":    alertType,
+		"message": message,
+		"agentId": agentID,
+		"time":    time.Now().Format(time.RFC3339),
+	}
+	data, _ := json.Marshal(payload)
+
+	for c := range eventClients {
+		_ = c.Conn.WriteMessage(websocket.TextMessage, data)
+	}
+}
+
+// handleEventsWebSocket upgrades connection to push events to the UI.
+func handleEventsWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade event connection: %v", err)
+		return
+	}
+	client := &ClientEventConnection{Conn: conn}
+	registerEventClient(client)
+	defer func() {
+		unregisterEventClient(client)
+		conn.Close()
+	}()
+
+	// Keep connection alive
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
 // ─── HTTP Handlers ────────────────────────────────────────────────────────────
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -353,6 +529,7 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
 
 // handleAgentConnection accepts a WebSocket connection from a Go agent.
 func handleAgentConnection(w http.ResponseWriter, r *http.Request) {
@@ -611,13 +788,20 @@ func broadcastToFrontend(agentID string, data []byte) {
 func main() {
 	initDB()
 
-	http.HandleFunc("/agent/connect", handleAgentConnection)
-	http.HandleFunc("/api/agents", corsMiddleware(handleListAgents))
-	http.HandleFunc("/api/agents/telemetry", corsMiddleware(handleAgentTelemetry))
-	http.HandleFunc("/api/alerts", corsMiddleware(handleListAlerts))
-	http.HandleFunc("/api/backups", corsMiddleware(handleListBackups))
-	http.HandleFunc("/api/backups/run", corsMiddleware(handleRunBackup))
-	http.HandleFunc("/terminal/ws", handleTerminalWebSocket)
+	// Public routes
+	http.HandleFunc("/api/auth/login", corsMiddleware(handleLogin))
+	http.HandleFunc("/agent/connect", handleAgentConnection) // for agent communication
+
+	// Protected routes wrapped with jwtMiddleware
+	http.HandleFunc("/api/agents", corsMiddleware(jwtMiddleware(handleListAgents)))
+	http.HandleFunc("/api/agents/telemetry", corsMiddleware(jwtMiddleware(handleAgentTelemetry)))
+	http.HandleFunc("/api/alerts", corsMiddleware(jwtMiddleware(handleListAlerts)))
+	http.HandleFunc("/api/backups", corsMiddleware(jwtMiddleware(handleListBackups)))
+	http.HandleFunc("/api/backups/run", corsMiddleware(jwtMiddleware(handleRunBackup)))
+	http.HandleFunc("/terminal/ws", jwtMiddleware(handleTerminalWebSocket))
+	
+	// Real-time notification socket for technicians (protected)
+	http.HandleFunc("/api/events/ws", jwtMiddleware(handleEventsWebSocket))
 
 	port := ":8080"
 	log.Printf("Backend starting on http://localhost%s\n", port)

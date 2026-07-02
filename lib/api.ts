@@ -57,13 +57,50 @@ export type BackupJob = {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function get<T>(path: string): Promise<T> {
+  const token = typeof window !== "undefined" ? localStorage.getItem("token") : ""
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  }
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`
+  }
+
   const res = await fetch(`${BACKEND}${path}`, {
     cache: "no-store",
-    headers: { Accept: "application/json" },
+    headers,
   })
   if (!res.ok) throw new Error(`API ${path} responded with ${res.status}`)
   return res.json() as Promise<T>
 }
+
+/** Authenticates against Go Backend and saves token in localStorage. */
+export async function authenticate(username: string, password: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${BACKEND}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    })
+    if (!res.ok) return false
+    const data = await res.json()
+    if (data.token) {
+      localStorage.setItem("token", data.token)
+      // Save token in cookies to allow middleware access
+      document.cookie = `token=${data.token}; path=/; max-age=86400;`
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+/** Logs out technician by clearing cookies and storage. */
+export function logout() {
+  localStorage.removeItem("token")
+  document.cookie = "token=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT;"
+}
+
 
 // ─── API Functions ────────────────────────────────────────────────────────────
 
@@ -106,9 +143,17 @@ export async function fetchBackups(): Promise<BackupJob[]> {
 /** Triggers a manual backup for the given agentId. */
 export async function runBackup(agentId: string): Promise<void> {
   try {
+    const token = typeof window !== "undefined" ? localStorage.getItem("token") : ""
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    }
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`
+    }
+
     await fetch(`${BACKEND}/api/backups/run`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ agentId }),
     })
   } catch {

@@ -3,6 +3,7 @@ import type { Metadata, Viewport } from 'next'
 import { Geist, Geist_Mono } from 'next/font/google'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { Toaster } from '@/components/ui/sonner'
+import { RealTimeNotifier } from '@/components/rmm/realtime-notifier'
 import './globals.css'
 
 const geistSans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] })
@@ -51,6 +52,7 @@ export default function RootLayout({
       className={`dark ${geistSans.variable} ${geistMono.variable}`}
     >
       <body className="bg-background font-sans antialiased">
+        <RealTimeNotifier />
         <TooltipProvider delay={200}>{children}</TooltipProvider>
         <Toaster position="bottom-right" />
         {process.env.NODE_ENV === 'production' && <Analytics />}

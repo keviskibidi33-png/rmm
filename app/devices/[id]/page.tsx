@@ -17,14 +17,25 @@ import { ConsoleShell } from "@/components/rmm/console-shell"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { alerts, deviceBackups, devices, osLabels } from "@/lib/rmm-data"
+import { alerts as mockAlerts, deviceBackups, devices as mockDevices, osLabels } from "@/lib/rmm-data"
+import { useAgents, agentToDevice, useAlerts } from "@/lib/use-live-data"
+import { RemoteTerminal } from "@/components/rmm/remote-terminal"
 
 export default function DeviceDetailPage() {
   const [tenant, setTenant] = React.useState("all")
   const [query, setQuery] = React.useState("")
+  const [showTerminal, setShowTerminal] = React.useState(false)
+  
   const params = useParams<{ id: string }>()
   const id = params?.id
-  const device = devices.find((item) => item.id === id)
+
+  // Load live agent data
+  const { agents } = useAgents(5000)
+  const { alerts: liveAlerts } = useAlerts(10000)
+
+  const liveDevices = React.useMemo(() => agents.map(agentToDevice), [agents])
+  const allDevices = liveDevices.length > 0 ? liveDevices : mockDevices
+  const device = allDevices.find((item) => item.id === id)
 
   if (!device) {
     return (
@@ -51,7 +62,18 @@ export default function DeviceDetailPage() {
     )
   }
 
-  const relatedAlerts = alerts.filter((alert) => alert.device === device.name)
+  // Filter alerts & backups
+  const allAlerts = liveAlerts.length > 0 
+    ? liveAlerts.map(a => ({
+        id: String(a.id),
+        device: a.agentId,
+        message: a.message,
+        severity: a.severity,
+        time: a.time ? new Date(a.time).toLocaleString() : ""
+      }))
+    : mockAlerts
+
+  const relatedAlerts = allAlerts.filter((alert) => alert.device === device.name || alert.device === device.id)
   const backups = deviceBackups.filter((backup) => backup.deviceId === device.id)
 
   return (
@@ -70,16 +92,19 @@ export default function DeviceDetailPage() {
         </Link>
         <div className="flex items-center gap-2">
           <Button
-            variant="outline"
+            variant={showTerminal ? "default" : "outline"}
             size="sm"
-            onClick={() =>
-              toast.success(`Terminal session queued for ${device.name}`, {
-                description: "Session broker is preparing secure shell access.",
-              })
-            }
+            onClick={() => {
+              setShowTerminal((prev) => !prev)
+              if (!showTerminal) {
+                toast.success(`Opening terminal session for ${device.name}`, {
+                  description: "Connecting interactive shell connection.",
+                })
+              }
+            }}
           >
             <TerminalSquare data-icon="inline-start" />
-            Terminal
+            {showTerminal ? "Close Terminal" : "Terminal"}
           </Button>
           <Button
             variant="outline"
@@ -107,6 +132,12 @@ export default function DeviceDetailPage() {
           </Button>
         </div>
       </div>
+
+      {showTerminal && (
+        <div className="my-2">
+          <RemoteTerminal agentId={device.id} />
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <Card className="gap-1 p-4">
@@ -139,7 +170,7 @@ export default function DeviceDetailPage() {
             </div>
             <div className="rounded-lg border border-border p-3">
               <p className="text-xs text-muted-foreground">Operating system</p>
-              <p className="font-medium">{osLabels[device.os]}</p>
+              <p className="font-medium">{osLabels[device.os] || device.os}</p>
             </div>
             <div className="rounded-lg border border-border p-3">
               <p className="text-xs text-muted-foreground">Status</p>
